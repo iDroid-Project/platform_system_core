@@ -27,11 +27,11 @@
 #include "parser.h"
 #include "init_parser.h"
 #include "log.h"
-#include "list.h"
 #include "property_service.h"
 #include "util.h"
 
 #include <cutils/iosched_policy.h>
+#include <cutils/list.h>
 
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
 #include <sys/_system_properties.h>
@@ -82,6 +82,7 @@ int lookup_keyword(const char *s)
         if (!strcmp(s, "lass")) return K_class;
         if (!strcmp(s, "lass_start")) return K_class_start;
         if (!strcmp(s, "lass_stop")) return K_class_stop;
+        if (!strcmp(s, "lass_reset")) return K_class_reset;
         if (!strcmp(s, "onsole")) return K_console;
         if (!strcmp(s, "hown")) return K_chown;
         if (!strcmp(s, "hmod")) return K_chmod;
@@ -112,6 +113,7 @@ int lookup_keyword(const char *s)
         break;
     case 'l':
         if (!strcmp(s, "oglevel")) return K_loglevel;
+        if (!strcmp(s, "oad_persist_props")) return K_load_persist_props;
         break;
     case 'm':
         if (!strcmp(s, "kdir")) return K_mkdir;
@@ -124,6 +126,8 @@ int lookup_keyword(const char *s)
         break;
     case 'r':
         if (!strcmp(s, "estart")) return K_restart;
+        if (!strcmp(s, "mdir")) return K_rmdir;
+        if (!strcmp(s, "m")) return K_rm;
         break;
     case 's':
         if (!strcmp(s, "ervice")) return K_service;
@@ -175,6 +179,14 @@ void parse_new_section(struct parse_state *state, int kw,
             return;
         }
         break;
+    case K_import:
+        if (nargs != 2) {
+            ERROR("single argument needed for import\n");
+        } else {
+            int ret = init_parse_config_file(args[1]);
+            if (ret)
+                ERROR("could not import file %s\n", args[1]);
+        }
     }
     state->parse_line = parse_line_no_op;
 }
@@ -187,7 +199,7 @@ static void parse_config(const char *fn, char *s)
 
     nargs = 0;
     state.filename = fn;
-    state.line = 1;
+    state.line = 0;
     state.ptr = s;
     state.nexttoken = 0;
     state.parse_line = parse_line_no_op;
@@ -197,6 +209,7 @@ static void parse_config(const char *fn, char *s)
             state.parse_line(&state, 0, 0);
             return;
         case T_NEWLINE:
+            state.line++;
             if (nargs) {
                 int kw = lookup_keyword(args[0]);
                 if (kw_is(kw, SECTION)) {
@@ -342,7 +355,8 @@ void queue_property_triggers(const char *name, const char *value)
 
             if (!strncmp(name, test, name_length) &&
                     test[name_length] == '=' &&
-                    !strcmp(test + name_length + 1, value)) {
+                    (!strcmp(test + name_length + 1, value) ||
+                     !strcmp(test + name_length + 1, "*"))) {
                 action_add_queue_tail(act);
             }
         }
@@ -372,7 +386,8 @@ void queue_all_property_triggers()
 
                     /* does the property exist, and match the trigger value? */
                     value = property_get(prop_name);
-                    if (value && !strcmp(equals + 1, value)) {
+                    if (value && (!strcmp(equals + 1, value) ||
+                                  !strcmp(equals + 1, "*"))) {
                         action_add_queue_tail(act);
                     }
                 }
@@ -484,6 +499,7 @@ static void parse_line_service(struct parse_state *state, int nargs, char **args
         break;
     case K_disabled:
         svc->flags |= SVC_DISABLED;
+        svc->flags |= SVC_RC_DISABLED;
         break;
     case K_ioprio:
         if (nargs != 3) {

@@ -25,6 +25,7 @@
 #include <sys/statfs.h>
 #include <sys/uio.h>
 #include <dirent.h>
+#include <ctype.h>
 
 #include <private/android_filesystem_config.h>
 
@@ -55,10 +56,6 @@
  * kernel, you must rollback the refcount to reflect the reference the
  * kernel did not actually acquire
  *
- *
- * Bugs:
- *
- * - need to move/rename node on RENAME
  */
 
 #define FUSE_TRACE 0
@@ -89,15 +86,21 @@ struct node {
     __u64 nid;
     __u64 gen;
 
-    struct node *next;
-    struct node *child;
-    struct node *all;
-    struct node *parent;
+    struct node *next;          /* per-dir sibling list */
+    struct node *child;         /* first contained file by this dir */
+    struct node *all;           /* global node list */
+    struct node *parent;        /* containing directory */
 
     __u32 refcount;
     __u32 namelen;
 
-    char name[1];
+    char *name;
+    /* If non-null, this is the real name of the file in the underlying storage.
+     * This may differ from the field "name" only by case.
+     * strlen(actual_name) will always equal strlen(name), so it is safe to use
+     * namelen for both fields.
+     */
+    char *actual_name;
 };
 
 struct fuse {
@@ -112,10 +115,24 @@ struct fuse {
     char rootpath[1024];
 };
 
+static unsigned uid = -1;
+static unsigned gid = -1;
+
 #define PATH_BUFFER_SIZE 1024
 
-char *node_get_path(struct node *node, char *buf, const char *name)
+#define NO_CASE_SENSITIVE_MATCH 0
+#define CASE_SENSITIVE_MATCH 1
+
+/*
+ * Get the real-life absolute path to a node.
+ *   node: start at this node
+ *   buf: storage for returned string
+ *   name: append this string to path if set
+ */
+char *do_node_get_path(struct node *node, char *buf, const char *name, int match_case_insensitive)
 {
+    struct node *in_node = node;
+    const char *in_name = name;
     char *out = buf + PATH_BUFFER_SIZE - 1;
     int len;
     out[0] = 0;
@@ -126,7 +143,7 @@ char *node_get_path(struct node *node, char *buf, const char *name)
     }
 
     while (node) {
-        name = node->name;
+        name = (node->actual_name ? node->actual_name : node->name);
         len = node->namelen;
         node = node->parent;
     start:
@@ -134,11 +151,45 @@ char *node_get_path(struct node *node, char *buf, const char *name)
             return 0;
         out -= len;
         memcpy(out, name, len);
-        out --;
-        out[0] = '/';
+        /* avoid double slash at beginning of path */
+        if (out[0] != '/') {
+            out --;
+            out[0] = '/';
+        }
     }
 
-    return out;
+    /* If we are searching for a file within node (rather than computing node's path)
+     * and fail, then we need to look for a case insensitive match.
+     */
+    if (in_name && match_case_insensitive && access(out, F_OK) != 0) {
+        char *path, buffer[PATH_BUFFER_SIZE];
+        DIR* dir;
+        struct dirent* entry;
+        path = do_node_get_path(in_node, buffer, NULL, NO_CASE_SENSITIVE_MATCH);
+        dir = opendir(path);
+        if (!dir) {
+            ERROR("opendir %s failed: %s", path, strerror(errno));
+            return out;
+        }
+
+        while ((entry = readdir(dir))) {
+            if (!strcasecmp(entry->d_name, in_name)) {
+                /* we have a match - replace the name */
+                len = strlen(in_name);
+                memcpy(buf + PATH_BUFFER_SIZE - len - 1, entry->d_name, len);
+                break;
+            }
+        }
+        closedir(dir);
+    }
+
+   return out;
+}
+
+char *node_get_path(struct node *node, char *buf, const char *name)
+{
+    /* We look for case insensitive matches by default */
+    return do_node_get_path(node, buf, name, CASE_SENSITIVE_MATCH);
 }
 
 void attr_from_stat(struct fuse_attr *attr, struct stat *s)
@@ -189,26 +240,82 @@ int node_get_attr(struct node *node, struct fuse_attr *attr)
     return 0;
 }
 
+static void add_node_to_parent(struct node *node, struct node *parent) {
+    node->parent = parent;
+    node->next = parent->child;
+    parent->child = node;
+    parent->refcount++;
+}
+
+/* Check to see if our parent directory already has a file with a name
+ * that differs only by case.  If we find one, store it in the actual_name
+ * field so node_get_path will map it to this file in the underlying storage.
+ */
+static void node_find_actual_name(struct node *node)
+{
+    char *path, buffer[PATH_BUFFER_SIZE];
+    const char *node_name = node->name;
+    DIR* dir;
+    struct dirent* entry;
+
+    if (!node->parent) return;
+
+    path = node_get_path(node->parent, buffer, 0);
+    dir = opendir(path);
+    if (!dir) {
+        ERROR("opendir %s failed: %s", path, strerror(errno));
+        return;
+    }
+
+    while ((entry = readdir(dir))) {
+        const char *test_name = entry->d_name;
+        if (strcmp(test_name, node_name) && !strcasecmp(test_name, node_name)) {
+            /* we have a match - differs but only by case */
+            node->actual_name = strdup(test_name);
+            if (!node->actual_name) {
+                ERROR("strdup failed - out of memory\n");
+                exit(1);
+            }
+            break;
+        }
+    }
+    closedir(dir);
+}
+
 struct node *node_create(struct node *parent, const char *name, __u64 nid, __u64 gen)
 {
     struct node *node;
     int namelen = strlen(name);
 
-    node = calloc(1, sizeof(struct node) + namelen);
+    node = calloc(1, sizeof(struct node));
     if (node == 0) {
+        return 0;
+    }
+    node->name = malloc(namelen + 1);
+    if (node->name == 0) {
+        free(node);
         return 0;
     }
 
     node->nid = nid;
     node->gen = gen;
-    node->parent = parent;
-    node->next = parent->child;
-    parent->child = node;
+    add_node_to_parent(node, parent);
     memcpy(node->name, name, namelen + 1);
     node->namelen = namelen;
-    parent->refcount++;
-
+    node_find_actual_name(node);
     return node;
+}
+
+static char *rename_node(struct node *node, const char *name)
+{
+    node->namelen = strlen(name);
+    char *newname = realloc(node->name, node->namelen + 1);
+    if (newname == 0)
+        return 0;
+    node->name = newname;
+    memcpy(node->name, name, node->namelen + 1);
+    node_find_actual_name(node);
+    return node->name;
 }
 
 void fuse_init(struct fuse *fuse, int fd, const char *path)
@@ -219,16 +326,10 @@ void fuse_init(struct fuse *fuse, int fd, const char *path)
 
     fuse->all = &fuse->root;
 
+    memset(&fuse->root, 0, sizeof(fuse->root));
     fuse->root.nid = FUSE_ROOT_ID; /* 1 */
-    fuse->root.next = 0;
-    fuse->root.child = 0;
-    fuse->root.parent = 0;
-
-    fuse->root.all = 0;
     fuse->root.refcount = 2;
-
-    strcpy(fuse->root.name, path);
-    fuse->root.namelen = strlen(fuse->root.name);
+    rename_node(&fuse->root, path);
 }
 
 static inline void *id_to_ptr(__u64 nid)
@@ -271,6 +372,37 @@ struct node *lookup_child_by_inode(struct node *node, __u64 nid)
     return 0;
 }
 
+static void dec_refcount(struct node *node) {
+    if (node->refcount > 0) {
+        node->refcount--;
+        TRACE("dec_refcount %p(%s) -> %d\n", node, node->name, node->refcount);
+    } else {
+        ERROR("Zero refcnt %p\n", node);
+    }
+ }
+
+static struct node *remove_child(struct node *parent, __u64 nid)
+{
+    struct node *prev = 0;
+    struct node *node;
+
+    for (node = parent->child; node; node = node->next) {
+        if (node->nid == nid) {
+            if (prev) {
+                prev->next = node->next;
+            } else {
+                parent->child = node->next;
+            }
+            node->next = 0;
+            node->parent = 0;
+            dec_refcount(parent);
+            return node;
+        }
+        prev = node;
+    }
+    return 0;
+}
+
 struct node *node_lookup(struct fuse *fuse, struct node *parent, const char *name,
                          struct fuse_attr *attr)
 {
@@ -305,7 +437,7 @@ struct node *node_lookup(struct fuse *fuse, struct node *parent, const char *nam
 void node_release(struct node *node)
 {
     TRACE("RELEASE %p (%s) rc=%d\n", node, node->name, node->refcount);
-    node->refcount--;
+    dec_refcount(node);
     if (node->refcount == 0) {
         if (node->parent->child == node) {
             node->parent->child = node->parent->child->next;
@@ -326,8 +458,10 @@ void node_release(struct node *node)
         node->next = 0;
 
             /* TODO: remove debugging - poison memory */
-        memset(node, 0xef, sizeof(*node) + strlen(node->name));
-
+        memset(node->name, 0xef, node->namelen);
+        free(node->name);
+        free(node->actual_name);
+        memset(node, 0xfc, sizeof(*node));
         free(node);
     }
 }
@@ -427,7 +561,7 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         struct fuse_getattr_in *req = data;
         struct fuse_attr_out out;
 
-        TRACE("GETATTR flags=%x fh=%llx\n",req->getattr_flags, req->fh);
+        TRACE("GETATTR flags=%x fh=%llx\n", req->getattr_flags, req->fh);
 
         memset(&out, 0, sizeof(out));
         node_get_attr(node, &out.attr);
@@ -439,15 +573,60 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
     case FUSE_SETATTR: { /* setattr_in -> attr_out */
         struct fuse_setattr_in *req = data;
         struct fuse_attr_out out;
+        char *path, buffer[PATH_BUFFER_SIZE];
+        int res = 0;
+        struct timespec times[2];
+
         TRACE("SETATTR fh=%llx id=%llx valid=%x\n",
               req->fh, hdr->nodeid, req->valid);
 
-            /* XXX */
+        /* XXX: incomplete implementation on purpose.   chmod/chown
+         * should NEVER be implemented.*/
 
+        path = node_get_path(node, buffer, 0);
+        if (req->valid & FATTR_SIZE)
+            res = truncate(path, req->size);
+        if (res)
+            goto getout;
+
+        /* Handle changing atime and mtime.  If FATTR_ATIME_and FATTR_ATIME_NOW
+         * are both set, then set it to the current time.  Else, set it to the
+         * time specified in the request.  Same goes for mtime.  Use utimensat(2)
+         * as it allows ATIME and MTIME to be changed independently, and has
+         * nanosecond resolution which fuse also has.
+         */
+        if (req->valid & (FATTR_ATIME | FATTR_MTIME)) {
+            times[0].tv_nsec = UTIME_OMIT;
+            times[1].tv_nsec = UTIME_OMIT;
+            if (req->valid & FATTR_ATIME) {
+                if (req->valid & FATTR_ATIME_NOW) {
+                  times[0].tv_nsec = UTIME_NOW;
+                } else {
+                  times[0].tv_sec = req->atime;
+                  times[0].tv_nsec = req->atimensec;
+                }
+            }
+            if (req->valid & FATTR_MTIME) {
+                if (req->valid & FATTR_MTIME_NOW) {
+                  times[1].tv_nsec = UTIME_NOW;
+                } else {
+                  times[1].tv_sec = req->mtime;
+                  times[1].tv_nsec = req->mtimensec;
+                }
+            }
+            TRACE("Calling utimensat on %s with atime %ld, mtime=%ld\n", path, times[0].tv_sec, times[1].tv_sec);
+            res = utimensat(-1, path, times, 0);
+        }
+
+        getout:
         memset(&out, 0, sizeof(out));
         node_get_attr(node, &out.attr);
         out.attr_valid = 10;
-        fuse_reply(fuse, hdr->unique, &out, sizeof(out));
+
+        if (res)
+            fuse_status(fuse, hdr->unique, -errno);
+        else
+            fuse_reply(fuse, hdr->unique, &out, sizeof(out));
         return;
     }
 //    case FUSE_READLINK:
@@ -457,6 +636,7 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         char *path, buffer[PATH_BUFFER_SIZE];
         char *name = ((char*) data) + sizeof(*req);
         int res;
+
         TRACE("MKNOD %s @ %llx\n", name, hdr->nodeid);
         path = node_get_path(node, buffer, name);
 
@@ -475,6 +655,7 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         char *path, buffer[PATH_BUFFER_SIZE];
         char *name = ((char*) data) + sizeof(*req);
         int res;
+
         TRACE("MKDIR %s @ %llx 0%o\n", name, hdr->nodeid, req->mode);
         path = node_get_path(node, buffer, name);
 
@@ -511,19 +692,49 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         char *newname = oldname + strlen(oldname) + 1;
         char *oldpath, oldbuffer[PATH_BUFFER_SIZE];
         char *newpath, newbuffer[PATH_BUFFER_SIZE];
-        struct node *newnode;
+        struct node *target;
+        struct node *newparent;
         int res;
 
-        newnode = lookup_by_inode(fuse, req->newdir);
-        if (!newnode) {
+        TRACE("RENAME %s->%s @ %llx\n", oldname, newname, hdr->nodeid);
+
+        target = lookup_child_by_name(node, oldname);
+        if (!target) {
             fuse_status(fuse, hdr->unique, -ENOENT);
             return;
         }
-
         oldpath = node_get_path(node, oldbuffer, oldname);
-        newpath = node_get_path(newnode, newbuffer, newname);
+
+        newparent = lookup_by_inode(fuse, req->newdir);
+        if (!newparent) {
+            fuse_status(fuse, hdr->unique, -ENOENT);
+            return;
+        }
+        if (newparent == node) {
+            /* Special case for renaming a file where destination
+             * is same path differing only by case.
+             * In this case we don't want to look for a case insensitive match.
+             * This allows commands like "mv foo FOO" to work as expected.
+             */
+            newpath = do_node_get_path(newparent, newbuffer, newname, NO_CASE_SENSITIVE_MATCH);
+        } else {
+            newpath = node_get_path(newparent, newbuffer, newname);
+        }
+
+        if (!remove_child(node, target->nid)) {
+            ERROR("RENAME remove_child not found");
+            fuse_status(fuse, hdr->unique, -ENOENT);
+            return;
+        }
+        if (!rename_node(target, newname)) {
+            fuse_status(fuse, hdr->unique, -ENOMEM);
+            return;
+        }
+        add_node_to_parent(target, newparent);
 
         res = rename(oldpath, newpath);
+        TRACE("RENAME result %d\n", res);
+
         fuse_status(fuse, hdr->unique, res ? -errno : 0);
         return;
     }
@@ -545,7 +756,7 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         h->fd = open(path, req->flags);
         if (h->fd < 0) {
             ERROR("ERROR\n");
-            fuse_status(fuse, hdr->unique, errno);
+            fuse_status(fuse, hdr->unique, -errno);
             free(h);
             return;
         }
@@ -565,9 +776,9 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
             fuse_status(fuse, hdr->unique, -EINVAL);
             return;
         }
-        res = pread(h->fd, buffer, req->size, req->offset);
+        res = pread64(h->fd, buffer, req->size, req->offset);
         if (res < 0) {
-            fuse_status(fuse, hdr->unique, errno);
+            fuse_status(fuse, hdr->unique, -errno);
             return;
         }
         fuse_reply(fuse, hdr->unique, buffer, res);
@@ -579,9 +790,9 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         struct handle *h = id_to_ptr(req->fh);
         int res;
         TRACE("WRITE %p(%d) %u@%llu\n", h, h->fd, req->size, req->offset);
-        res = pwrite(h->fd, ((char*) data) + sizeof(*req), req->size, req->offset);
+        res = pwrite64(h->fd, ((char*) data) + sizeof(*req), req->size, req->offset);
         if (res < 0) {
-            fuse_status(fuse, hdr->unique, errno);
+            fuse_status(fuse, hdr->unique, -errno);
             return;
         }
         out.size = res;
@@ -661,13 +872,19 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         struct dirent *de;
         struct dirhandle *h = id_to_ptr(req->fh);
         TRACE("READDIR %p\n", h);
+        if (req->offset == 0) {
+            /* rewinddir() might have been called above us, so rewind here too */
+            TRACE("calling rewinddir()\n");
+            rewinddir(h->d);
+        }
         de = readdir(h->d);
         if (!de) {
             fuse_status(fuse, hdr->unique, 0);
             return;
         }
         fde->ino = FUSE_UNKNOWN_INO;
-        fde->off = 0;
+        /* increment the offset so we can detect when rewinddir() seeks back to the beginning */
+        fde->off = req->offset + 1;
         fde->type = de->d_type;
         fde->namelen = strlen(de->d_name);
         memcpy(fde->name, de->d_name, fde->namelen + 1);
@@ -695,7 +912,7 @@ void handle_fuse_request(struct fuse *fuse, struct fuse_in_header *hdr, void *da
         out.major = FUSE_KERNEL_VERSION;
         out.minor = FUSE_KERNEL_MINOR_VERSION;
         out.max_readahead = req->max_readahead;
-        out.flags = 0;
+        out.flags = FUSE_ATOMIC_O_TRUNC;
         out.max_background = 32;
         out.congestion_threshold = 32;
         out.max_write = 256 * 1024;
@@ -735,29 +952,43 @@ void handle_fuse_requests(struct fuse *fuse)
     }
 }
 
+static int usage()
+{
+    ERROR("usage: sdcard [-l -f] <path> <uid> <gid>\n\n\t-l force file names to lower case when creating new files\n\t-f fix up file system before starting (repairs bad file name case and group ownership)\n");
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     struct fuse fuse;
     char opts[256];
     int fd;
     int res;
-    unsigned uid;
-    unsigned gid;
-    const char *path;
+    const char *path = NULL;
+    int i;
 
-    if (argc != 4) {
-        ERROR("usage: sdcard <path> <uid> <gid>\n");
-        return -1;
+    for (i = 1; i < argc; i++) {
+        char* arg = argv[i];
+        if (!path)
+            path = arg;
+        else if (uid == -1)
+            uid = strtoul(arg, 0, 10);
+        else if (gid == -1)
+            gid = strtoul(arg, 0, 10);
+        else {
+            ERROR("too many arguments\n");
+            return usage();
+        }
     }
 
-    uid = strtoul(argv[2], 0, 10);
-    gid = strtoul(argv[3], 0, 10);
-    if (!uid || !gid) {
+    if (!path) {
+        ERROR("no path specified\n");
+        return usage();
+    }
+    if (uid <= 0 || gid <= 0) {
         ERROR("uid and gid must be nonzero\n");
-        return -1;
+        return usage();
     }
-
-    path = argv[1];
 
         /* cleanup from previous instance, if necessary */
     umount2(MOUNT_POINT, 2);

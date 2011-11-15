@@ -37,11 +37,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <pwd.h>
+#include <sys/stat.h>
+
 #define BUF_MAX 1024
-#define CMD_DISPLAY_MAX 10
+#define CMD_DISPLAY_MAX (9 + 1)
+#define USER_DISPLAY_MAX (10 + 1)
 
 struct pid_info_t {
     pid_t pid;
+    char user[USER_DISPLAY_MAX];
 
     char cmdline[CMD_DISPLAY_MAX];
 
@@ -82,7 +87,8 @@ void print_type(char *type, struct pid_info_t* info)
     if (!strcmp(link_dest, "/"))
         goto out;
 
-    printf("%-9s %5d %10s %4s %9s %18s %9s %10s %s\n", info->cmdline, info->pid, "???", type,
+    printf("%-9s %5d %10s %4s %9s %18s %9s %10s %s\n",
+            info->cmdline, info->pid, info->user, type,
             "???", "???", "???", "???", link_dest);
 
 out:
@@ -113,7 +119,8 @@ void print_maps(struct pid_info_t* info)
         if (inode == 0 || !strcmp(device, "00:00"))
             continue;
 
-        printf("%-9s %5d %10s %4s %9s %18s %9zd %10ld %s\n", info->cmdline, info->pid, "???", "mem",
+        printf("%-9s %5d %10s %4s %9s %18s %9zd %10ld %s\n",
+                info->cmdline, info->pid, info->user, "mem",
                 "???", device, offset, inode, file);
     }
 
@@ -136,7 +143,8 @@ void print_fds(struct pid_info_t* info)
     if (dir == NULL) {
         char msg[BUF_MAX];
         snprintf(msg, sizeof(msg), "%s (opendir: %s)", info->path, strerror(errno));
-        printf("%-9s %5d %10s %4s %9s %18s %9s %10s %s\n", info->cmdline, info->pid, "???", "FDS",
+        printf("%-9s %5d %10s %4s %9s %18s %9s %10s %s\n",
+                info->cmdline, info->pid, info->user, "FDS",
                 "", "", "", "", msg);
         goto out;
     }
@@ -159,11 +167,25 @@ void lsof_dumpinfo(pid_t pid)
 {
     int fd;
     struct pid_info_t info;
+    struct stat pidstat;
+    struct passwd *pw;
+
     info.pid = pid;
-
     snprintf(info.path, sizeof(info.path), "/proc/%d/", pid);
-
     info.parent_length = strlen(info.path);
+
+    // Get the UID by calling stat on the proc/pid directory.
+    if (!stat(info.path, &pidstat)) {
+        pw = getpwuid(pidstat.st_uid);
+        if (pw) {
+            strncpy(info.user, pw->pw_name, USER_DISPLAY_MAX - 1);
+            info.user[USER_DISPLAY_MAX - 1] = '\0';
+        } else {
+            snprintf(info.user, USER_DISPLAY_MAX, "%d", (int)pidstat.st_uid);
+        }
+    } else {
+        strcpy(info.user, "???");
+    }
 
     // Read the command line information; each argument is terminated with NULL.
     strncat(info.path, "cmdline", sizeof(info.path));
@@ -196,28 +218,37 @@ void lsof_dumpinfo(pid_t pid)
 
 int lsof_main(int argc, char *argv[])
 {
-    DIR *dir = opendir("/proc");
-    if (dir == NULL) {
-        fprintf(stderr, "Couldn't open /proc\n");
-        return -1;
+    long int pid = 0;
+    char* endptr;
+    if (argc == 2) {
+        pid = strtol(argv[1], &endptr, 10);
     }
 
     print_header();
 
-    struct dirent* de;
-    while ((de = readdir(dir))) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-
-        // Only inspect directories that are PID numbers
-        char* endptr;
-        long int pid = strtol(de->d_name, &endptr, 10);
-        if (*endptr != '\0')
-            continue;
-
+    if (pid) {
         lsof_dumpinfo(pid);
+    } else {
+        DIR *dir = opendir("/proc");
+        if (dir == NULL) {
+            fprintf(stderr, "Couldn't open /proc\n");
+            return -1;
+        }
+
+        struct dirent* de;
+        while ((de = readdir(dir))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+
+            // Only inspect directories that are PID numbers
+            pid = strtol(de->d_name, &endptr, 10);
+            if (*endptr != '\0')
+                continue;
+
+            lsof_dumpinfo(pid);
+        }
+        closedir(dir);
     }
-    closedir(dir);
 
     return 0;
 }

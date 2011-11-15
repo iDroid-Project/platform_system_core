@@ -36,8 +36,8 @@
 
 #include <dirent.h>
 
+#include <netutils/ifc.h>
 #include "dhcpmsg.h"
-#include "ifc_utils.h"
 #include "packet.h"
 
 #define VERBOSE 2
@@ -85,17 +85,15 @@ int fatal(const char *reason)
 //    exit(1);
 }
 
-const char *ipaddr(uint32_t addr)
+const char *ipaddr(in_addr_t addr)
 {
-    static char buf[32];
+    struct in_addr in_addr;
 
-    sprintf(buf,"%d.%d.%d.%d",
-            addr & 255,
-            ((addr >> 8) & 255),
-            ((addr >> 16) & 255),
-            (addr >> 24));
-    return buf;
+    in_addr.s_addr = addr;
+    return inet_ntoa(in_addr);
 }
+
+extern int ipv4NetmaskToPrefixLength(in_addr_t mask);
 
 typedef struct dhcp_info dhcp_info;
 
@@ -104,7 +102,7 @@ struct dhcp_info {
 
     uint32_t ipaddr;
     uint32_t gateway;
-    uint32_t netmask;
+    uint32_t prefixLength;
 
     uint32_t dns1;
     uint32_t dns2;
@@ -115,44 +113,24 @@ struct dhcp_info {
 
 dhcp_info last_good_info;
 
-void get_dhcp_info(uint32_t *ipaddr, uint32_t *gateway, uint32_t *mask,
+void get_dhcp_info(uint32_t *ipaddr, uint32_t *gateway, uint32_t *prefixLength,
                    uint32_t *dns1, uint32_t *dns2, uint32_t *server,
                    uint32_t *lease)
 {
     *ipaddr = last_good_info.ipaddr;
     *gateway = last_good_info.gateway;
-    *mask = last_good_info.netmask;
+    *prefixLength = last_good_info.prefixLength;
     *dns1 = last_good_info.dns1;
     *dns2 = last_good_info.dns2;
     *server = last_good_info.serveraddr;
     *lease = last_good_info.lease;
 }
 
-static int ifc_configure(const char *ifname, dhcp_info *info)
+static int dhcp_configure(const char *ifname, dhcp_info *info)
 {
-    char dns_prop_name[PROPERTY_KEY_MAX];
-
-    if (ifc_set_addr(ifname, info->ipaddr)) {
-        printerr("failed to set ipaddr %s: %s\n", ipaddr(info->ipaddr), strerror(errno));
-        return -1;
-    }
-    if (ifc_set_mask(ifname, info->netmask)) {
-        printerr("failed to set netmask %s: %s\n", ipaddr(info->netmask), strerror(errno));
-        return -1;
-    }
-    if (ifc_create_default_route(ifname, info->gateway)) {
-        printerr("failed to set default route %s: %s\n", ipaddr(info->gateway), strerror(errno));
-        return -1;
-    }
-
-    snprintf(dns_prop_name, sizeof(dns_prop_name), "net.%s.dns1", ifname);
-    property_set(dns_prop_name, info->dns1 ? ipaddr(info->dns1) : "");
-    snprintf(dns_prop_name, sizeof(dns_prop_name), "net.%s.dns2", ifname);
-    property_set(dns_prop_name, info->dns2 ? ipaddr(info->dns2) : "");
-
     last_good_info = *info;
-
-    return 0;
+    return ifc_configure(ifname, info->ipaddr, info->prefixLength, info->gateway,
+                         info->dns1, info->dns2);
 }
 
 static const char *dhcp_type_to_name(uint32_t type)
@@ -177,8 +155,7 @@ void dump_dhcp_info(dhcp_info *info)
             dhcp_type_to_name(info->type), info->type);
     strcpy(addr, ipaddr(info->ipaddr));
     strcpy(gway, ipaddr(info->gateway));
-    strcpy(mask, ipaddr(info->netmask));
-    LOGD("ip %s gw %s mask %s", addr, gway, mask);
+    LOGD("ip %s gw %s prefixLength %d", addr, gway, info->prefixLength);
     if (info->dns1) LOGD("dns1: %s", ipaddr(info->dns1));
     if (info->dns2) LOGD("dns2: %s", ipaddr(info->dns2));
     LOGD("server %s, lease %d seconds",
@@ -220,7 +197,7 @@ int decode_dhcp_msg(dhcp_msg *msg, int len, dhcp_info *info)
         }
         switch(opt) {
         case OPT_SUBNET_MASK:
-            if (optlen >= 4) memcpy(&info->netmask, x, 4);
+            if (optlen >= 4) info->prefixLength = ipv4NetmaskToPrefixLength(*((uint32_t*)x));
             break;
         case OPT_GATEWAY:
             if (optlen >= 4) memcpy(&info->gateway, x, 4);
@@ -449,7 +426,7 @@ int dhcp_init_ifc(const char *ifname)
                 printerr("timed out\n");
                 if ( info.type == DHCPOFFER ) {
                     printerr("no acknowledgement from DHCP server\nconfiguring %s with offered parameters\n", ifname);
-                    return ifc_configure(ifname, &info);
+                    return dhcp_configure(ifname, &info);
                 }
                 errno = ETIME;
                 close(s);
@@ -530,7 +507,7 @@ int dhcp_init_ifc(const char *ifname)
             if (info.type == DHCPACK) {
                 printerr("configuring %s\n", ifname);
                 close(s);
-                return ifc_configure(ifname, &info);
+                return dhcp_configure(ifname, &info);
             } else if (info.type == DHCPNAK) {
                 printerr("configuration request denied\n");
                 close(s);

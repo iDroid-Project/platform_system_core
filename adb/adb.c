@@ -36,6 +36,9 @@
 #include "usb_vendors.h"
 #endif
 
+#if ADB_TRACE
+ADB_MUTEX_DEFINE( D_lock );
+#endif
 
 int HOST = 0;
 
@@ -90,6 +93,7 @@ void  adb_trace_init(void)
         { "sysdeps", TRACE_SYSDEPS },
         { "transport", TRACE_TRANSPORT },
         { "jdwp", TRACE_JDWP },
+        { "services", TRACE_SERVICES },
         { NULL, 0 }
     };
 
@@ -302,8 +306,10 @@ void handle_packet(apacket *p, atransport *t)
 {
     asocket *s;
 
-    D("handle_packet() %d\n", p->msg.command);
-
+    D("handle_packet() %c%c%c%c\n", ((char*) (&(p->msg.command)))[0],
+            ((char*) (&(p->msg.command)))[1],
+            ((char*) (&(p->msg.command)))[2],
+            ((char*) (&(p->msg.command)))[3]);
     print_packet("recv", p);
 
     switch(p->msg.command){
@@ -589,14 +595,6 @@ nomem:
     return 0;
 }
 
-#ifdef HAVE_FORKEXEC
-static void sigchld_handler(int n)
-{
-    int status;
-    while(waitpid(-1, &status, WNOHANG) > 0) ;
-}
-#endif
-
 #ifdef HAVE_WIN32_PROC
 static BOOL WINAPI ctrlc_handler(DWORD type)
 {
@@ -639,6 +637,7 @@ void start_logging(void)
 
     fd = unix_open("/dev/null", O_RDONLY);
     dup2(fd, 0);
+    adb_close(fd);
 
     fd = unix_open("/tmp/adb.log", O_WRONLY | O_CREAT | O_APPEND, 0640);
     if(fd < 0) {
@@ -646,6 +645,7 @@ void start_logging(void)
     }
     dup2(fd, 1);
     dup2(fd, 2);
+    adb_close(fd);
     fprintf(stderr,"--- adb starting (pid %d) ---\n", getpid());
 #endif
 }
@@ -680,9 +680,11 @@ void start_device_log(void)
     dup2(fd, 1);
     dup2(fd, 2);
     fprintf(stderr,"--- adb starting (pid %d) ---\n", getpid());
+    adb_close(fd);
 
     fd = unix_open("/dev/null", O_RDONLY);
     dup2(fd, 0);
+    adb_close(fd);
 }
 #endif
 
@@ -803,9 +805,10 @@ int launch_server(int server_port)
         // wait for the "OK\n" message
         adb_close(fd[1]);
         int ret = adb_read(fd[0], temp, 3);
+        int saved_errno = errno;
         adb_close(fd[0]);
         if (ret < 0) {
-            fprintf(stderr, "could not read ok from ADB Server, errno = %d\n", errno);
+            fprintf(stderr, "could not read ok from ADB Server, errno = %d\n", saved_errno);
             return -1;
         }
         if (ret != 3 || temp[0] != 'O' || temp[1] != 'K' || temp[2] != '\n') {
@@ -844,7 +847,7 @@ int adb_main(int is_daemon, int server_port)
 #ifdef HAVE_WIN32_PROC
     SetConsoleCtrlHandler( ctrlc_handler, TRUE );
 #elif defined(HAVE_FORKEXEC)
-    signal(SIGCHLD, sigchld_handler);
+    // No SIGCHLD. Let the service subproc handle its children.
     signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -868,12 +871,12 @@ int adb_main(int is_daemon, int server_port)
     */
     property_get("ro.kernel.qemu", value, "");
     if (strcmp(value, "1") != 0) {
-        property_get("ro.secure", value, "");
+        property_get("ro.secure", value, "1");
         if (strcmp(value, "1") == 0) {
             // don't run as root if ro.secure is set...
             secure = 1;
 
-            // ... except we allow running as root in userdebug builds if the 
+            // ... except we allow running as root in userdebug builds if the
             // service.adb.root property has been set by the "adb root" command
             property_get("ro.debuggable", value, "");
             if (strcmp(value, "1") == 0) {
@@ -953,7 +956,9 @@ int adb_main(int is_daemon, int server_port)
         // listen on default port
         local_init(DEFAULT_ADB_LOCAL_TRANSPORT_PORT);
     }
+    D("adb_main(): pre init_jdwp()\n");
     init_jdwp();
+    D("adb_main(): post init_jdwp()\n");
 #endif
 
     if (is_daemon)
@@ -967,6 +972,7 @@ int adb_main(int is_daemon, int server_port)
 #endif
         start_logging();
     }
+    D("Event loop starting\n");
 
     fdevent_loop();
 
@@ -1104,7 +1110,7 @@ int handle_host_request(char *service, transport_type ttype, char* serial, int r
             type = kTransportAny;
         } else if (!strncmp(service, "transport:", strlen("transport:"))) {
             service += strlen("transport:");
-            serial = strdup(service);
+            serial = service;
         }
 
         transport = acquire_one_transport(CS_ANY, type, serial, &error_string);
@@ -1264,9 +1270,10 @@ int recovery_mode = 0;
 
 int main(int argc, char **argv)
 {
-    adb_trace_init();
 #if ADB_HOST
     adb_sysdeps_init();
+    adb_trace_init();
+    D("Handling commandline()\n");
     return adb_commandline(argc - 1, argv + 1);
 #else
     if((argc > 1) && (!strcmp(argv[1],"recovery"))) {
@@ -1275,6 +1282,7 @@ int main(int argc, char **argv)
     }
 
     start_device_log();
+    D("Handling main()\n");
     return adb_main(0, DEFAULT_ADB_PORT);
 #endif
 }

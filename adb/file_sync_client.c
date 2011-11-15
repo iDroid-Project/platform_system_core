@@ -57,9 +57,9 @@ static void END()
     if (t == 0)  /* prevent division by 0 :-) */
         t = 1000000;
 
-    fprintf(stderr,"%lld KB/s (%d bytes in %lld.%03llds)\n",
+    fprintf(stderr,"%lld KB/s (%lld bytes in %lld.%03llds)\n",
             ((((long long) total_bytes) * 1000000LL) / t) / 1024LL,
-            total_bytes, (t / 1000000LL), (t % 1000000LL) / 1000LL);
+            (long long) total_bytes, (t / 1000000LL), (t % 1000000LL) / 1000LL);
 }
 
 void sync_quit(int fd)
@@ -641,8 +641,9 @@ static int local_build_list(copyinfo **filelist,
         } else {
             ci = mkcopyinfo(lpath, rpath, name, 0);
             if(lstat(ci->src, &st)) {
-                closedir(d);
                 fprintf(stderr,"cannot stat '%s': %s\n", ci->src, strerror(errno));
+                closedir(d);
+
                 return -1;
             }
             if(!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {

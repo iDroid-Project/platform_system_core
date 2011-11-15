@@ -15,8 +15,8 @@
 
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof(x[0]))
 
-// FIXME - only one loop mount is supported at a time
-#define LOOP_DEVICE "/dev/block/loop0"
+#define DEFAULT_LOOP_DEVICE "/dev/block/loop0"
+#define LOOPDEV_MAXLEN 64
 
 struct mount_opts {
 	const char str[8];
@@ -87,7 +87,7 @@ static void add_extra_option(struct extra_opts *extra, char *s)
 }
 
 static unsigned long
-parse_mount_options(char *arg, unsigned long rwflag, struct extra_opts *extra, int* loop)
+parse_mount_options(char *arg, unsigned long rwflag, struct extra_opts *extra, int* loop, char *loopdev)
 {
 	char *s;
     
@@ -100,8 +100,15 @@ parse_mount_options(char *arg, unsigned long rwflag, struct extra_opts *extra, i
 		if (no)
 			s += 2;
 
+        if (strncmp(s, "loop=", 5) == 0) {
+            *loop = 1;
+            strlcpy(loopdev, s + 5, LOOPDEV_MAXLEN);
+            continue;
+        }
+
         if (strcmp(s, "loop") == 0) {
             *loop = 1;
+            strlcpy(loopdev, DEFAULT_LOOP_DEVICE, LOOPDEV_MAXLEN);
             continue;
         }
 		for (i = 0, res = 1; i < ARRAY_SIZE(options); i++) {
@@ -131,7 +138,8 @@ static struct extra_opts extra;
 static unsigned long rwflag;
 
 static int
-do_mount(char *dev, char *dir, char *type, unsigned long rwflag, void *data, int loop)
+do_mount(char *dev, char *dir, char *type, unsigned long rwflag, void *data, int loop,
+         char *loopdev)
 {
 	char *s;
 	int error = 0;
@@ -142,14 +150,13 @@ do_mount(char *dev, char *dir, char *type, unsigned long rwflag, void *data, int
 
         flags = (rwflag & MS_RDONLY) ? O_RDONLY : O_RDWR;
         
-        // FIXME - only one loop mount supported at a time
         file_fd = open(dev, flags);
-        if (file_fd < -1) {
+        if (file_fd < 0) {
             perror("open backing file failed");
             return 1;
         }
-        device_fd = open(LOOP_DEVICE, flags);
-        if (device_fd < -1) {
+        device_fd = open(loopdev, flags);
+        if (device_fd < 0) {
             perror("open loop device failed");
             close(file_fd);
             return 1;
@@ -163,7 +170,7 @@ do_mount(char *dev, char *dir, char *type, unsigned long rwflag, void *data, int
 
         close(file_fd);
         close(device_fd);
-        dev = LOOP_DEVICE;
+        dev = loopdev;
     }
 
 	while ((s = strsep(&type, ",")) != NULL) {
@@ -222,11 +229,53 @@ static int print_mounts()
     return 0;
 }
 
+static int get_mounts_dev_dir(const char *arg, char **dev, char **dir)
+{
+	FILE *f;
+	char mount_dev[256];
+	char mount_dir[256];
+	char mount_type[256];
+	char mount_opts[256];
+	int mount_freq;
+	int mount_passno;
+	int match;
+
+	f = fopen("/proc/mounts", "r");
+	if (!f) {
+		fprintf(stdout, "could not open /proc/mounts\n");
+		return -1;
+	}
+
+	do {
+		match = fscanf(f, "%255s %255s %255s %255s %d %d\n",
+					   mount_dev, mount_dir, mount_type,
+					   mount_opts, &mount_freq, &mount_passno);
+		mount_dev[255] = 0;
+		mount_dir[255] = 0;
+		mount_type[255] = 0;
+		mount_opts[255] = 0;
+		if (match == 6 &&
+			(strcmp(arg, mount_dev) == 0 ||
+			 strcmp(arg, mount_dir) == 0)) {
+			*dev = strdup(mount_dev);
+			*dir = strdup(mount_dir);
+			fclose(f);
+			return 0;
+		}
+	} while (match != EOF);
+
+	fclose(f);
+	return -1;
+}
+
 int mount_main(int argc, char *argv[])
 {
 	char *type = NULL;
+	char *dev = NULL;
+	char *dir = NULL;
 	int c;
 	int loop = 0;
+	char loopdev[LOOPDEV_MAXLEN];
 
 	progname = argv[0];
 	rwflag = MS_VERBOSE;
@@ -240,7 +289,7 @@ int mount_main(int argc, char *argv[])
 			break;
 		switch (c) {
 		case 'o':
-			rwflag = parse_mount_options(optarg, rwflag, &extra, &loop);
+			rwflag = parse_mount_options(optarg, rwflag, &extra, &loop, loopdev);
 			break;
 		case 'r':
 			rwflag |= MS_RDONLY;
@@ -265,12 +314,19 @@ int mount_main(int argc, char *argv[])
 	if (rwflag & MS_TYPE)
 		type = "none";
 
-	if (optind + 2 != argc || type == NULL) {
+	if (optind + 2 == argc) {
+		dev = argv[optind];
+		dir = argv[optind + 1];
+	} else if (optind + 1 == argc && rwflag & MS_REMOUNT) {
+		get_mounts_dev_dir(argv[optind], &dev, &dir);
+	}
+
+	if (dev == NULL || dir == NULL || type == NULL) {
 		fprintf(stderr, "Usage: %s [-r] [-w] [-o options] [-t type] "
 			"device directory\n", progname);
 		exit(1);
 	}
 
-	return do_mount(argv[optind], argv[optind + 1], type, rwflag,
-		        extra.str, loop);
+	return do_mount(dev, dir, type, rwflag, extra.str, loop, loopdev);
+	/* We leak dev and dir in some cases, but we're about to exit */
 }

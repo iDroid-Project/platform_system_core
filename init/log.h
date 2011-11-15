@@ -17,17 +17,12 @@
 #ifndef _INIT_LOG_H_
 #define _INIT_LOG_H_
 
-void log_init(void);
-void log_set_level(int level);
-void log_close(void);
-void log_write(int level, const char *fmt, ...)
-    __attribute__ ((format(printf, 2, 3)));
+#include <cutils/klog.h>
 
-#define ERROR(x...)   log_write(3, "<3>init: " x)
-#define NOTICE(x...)  log_write(5, "<5>init: " x)
-#define INFO(x...)    log_write(6, "<6>init: " x)
+#define ERROR(x...)   KLOG_ERROR("init", x)
+#define NOTICE(x...)  KLOG_NOTICE("init", x)
+#define INFO(x...)    KLOG_INFO("init", x)
 
-#define LOG_DEFAULT_LEVEL  3  /* messages <= this level are logged */
 #define LOG_UEVENTS        0  /* log uevent messages if 1. verbose */
 
 #endif

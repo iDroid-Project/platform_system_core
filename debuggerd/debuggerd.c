@@ -573,7 +573,7 @@ static void handle_crashing_process(int fd)
         goto done;
     }
 
-    sprintf(buf,"/proc/%d/task/%d", cr.pid, tid);
+    snprintf(buf, sizeof buf, "/proc/%d/task/%d", cr.pid, tid);
     if(stat(buf, &s)) {
         LOG("tid %d does not exist in pid %d. ignoring debug request\n",
             tid, cr.pid);
@@ -583,17 +583,49 @@ static void handle_crashing_process(int fd)
 
     XLOG("BOOM: pid=%d uid=%d gid=%d tid=%d\n", cr.pid, cr.uid, cr.gid, tid);
 
+    /* Note that at this point, the target thread's signal handler
+     * is blocked in a read() call. This gives us the time to PTRACE_ATTACH
+     * to it before it has a chance to really fault.
+     *
+     * After the attach, the thread is stopped, and we write to the file
+     * descriptor to ensure that it will run as soon as we call PTRACE_CONT
+     * below. See details in bionic/libc/linker/debugger.c, in function
+     * debugger_signal_handler().
+     */
     tid_attach_status = ptrace(PTRACE_ATTACH, tid, 0, 0);
+    int ptrace_error = errno;
+
+    if (TEMP_FAILURE_RETRY(write(fd, &tid, 1)) != 1) {
+        XLOG("failed responding to client: %s\n",
+            strerror(errno));
+        goto done;
+    }
+
     if(tid_attach_status < 0) {
-        LOG("ptrace attach failed: %s\n", strerror(errno));
+        LOG("ptrace attach failed: %s\n", strerror(ptrace_error));
         goto done;
     }
 
     close(fd);
     fd = -1;
 
+    const int sleep_time_usec = 200000;         /* 0.2 seconds */
+    const int max_total_sleep_usec = 3000000;   /* 3 seconds */
+    int loop_limit = max_total_sleep_usec / sleep_time_usec;
     for(;;) {
-        n = waitpid(tid, &status, __WALL);
+        if (loop_limit-- == 0) {
+            LOG("timed out waiting for pid=%d tid=%d uid=%d to die\n",
+                cr.pid, tid, cr.uid);
+            goto done;
+        }
+        n = waitpid(tid, &status, __WALL | WNOHANG);
+
+        if (n == 0) {
+            /* not ready yet */
+            XLOG("not ready yet\n");
+            usleep(sleep_time_usec);
+            continue;
+        }
 
         if(n < 0) {
             if(errno == EAGAIN) continue;
@@ -683,6 +715,18 @@ int main()
     struct sigaction act;
     int logsocket = -1;
 
+    /*
+     * debuggerd crashes can't be reported to debuggerd.  Reset all of the
+     * crash handlers.
+     */
+    signal(SIGILL, SIG_DFL);
+    signal(SIGABRT, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    signal(SIGFPE, SIG_DFL);
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGSTKFLT, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+
     logsocket = socket_local_client("logd",
             ANDROID_SOCKET_NAMESPACE_ABSTRACT, SOCK_DGRAM);
     if(logsocket < 0) {
@@ -710,8 +754,12 @@ int main()
         int fd;
 
         alen = sizeof(addr);
+        XLOG("waiting for connection\n");
         fd = accept(s, &addr, &alen);
-        if(fd < 0) continue;
+        if(fd < 0) {
+            XLOG("accept failed: %s\n", strerror(errno));
+            continue;
+        }
 
         fcntl(fd, F_SETFD, FD_CLOEXEC);
 

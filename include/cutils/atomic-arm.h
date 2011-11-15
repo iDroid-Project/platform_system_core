@@ -28,24 +28,39 @@ extern inline void android_compiler_barrier(void)
 #if ANDROID_SMP == 0
 extern inline void android_memory_barrier(void)
 {
-  android_compiler_barrier();
+    android_compiler_barrier();
+}
+extern inline void android_memory_store_barrier(void)
+{
+    android_compiler_barrier();
 }
 #elif defined(__ARM_HAVE_DMB)
 extern inline void android_memory_barrier(void)
 {
     __asm__ __volatile__ ("dmb" : : : "memory");
 }
+extern inline void android_memory_store_barrier(void)
+{
+    __asm__ __volatile__ ("dmb st" : : : "memory");
+}
 #elif defined(__ARM_HAVE_LDREX_STREX)
 extern inline void android_memory_barrier(void)
 {
-    __asm__ __volatile__ ("mcr p15, 0, %0, c7, c10, 5"
-                          : : "r" (0) : "memory");
+    __asm__ __volatile__ ("mcr p15, 0, %0, c7, c10, 5" : : "r" (0) : "memory");
+}
+extern inline void android_memory_store_barrier(void)
+{
+    android_memory_barrier();
 }
 #else
 extern inline void android_memory_barrier(void)
 {
     typedef void (kuser_memory_barrier)(void);
     (*(kuser_memory_barrier *)0xffff0fa0)();
+}
+extern inline void android_memory_store_barrier(void)
+{
+    android_memory_barrier();
 }
 #endif
 
@@ -129,38 +144,6 @@ extern inline int android_atomic_release_cas(int32_t old_value,
     return android_atomic_cas(old_value, new_value, ptr);
 }
 
-
-#if defined(__thumb__)
-extern int32_t android_atomic_swap(int32_t new_value,
-                                   volatile int32_t *ptr);
-#elif defined(__ARM_HAVE_LDREX_STREX)
-extern inline int32_t android_atomic_swap(int32_t new_value,
-                                          volatile int32_t *ptr)
-{
-    int32_t prev, status;
-    do {
-        __asm__ __volatile__ ("ldrex %0, [%3]\n"
-                              "strex %1, %4, [%3]"
-                              : "=&r" (prev), "=&r" (status), "+m" (*ptr)
-                              : "r" (ptr), "r" (new_value)
-                              : "cc");
-    } while (__builtin_expect(status != 0, 0));
-    android_memory_barrier();
-    return prev;
-}
-#else
-extern inline int32_t android_atomic_swap(int32_t new_value,
-                                          volatile int32_t *ptr)
-{
-    int32_t prev;
-    __asm__ __volatile__ ("swp %0, %2, [%3]"
-                          : "=&r" (prev), "+m" (*ptr)
-                          : "r" (new_value), "r" (ptr)
-                          : "cc");
-    android_memory_barrier();
-    return prev;
-}
-#endif
 
 #if defined(__thumb__)
 extern int32_t android_atomic_add(int32_t increment,

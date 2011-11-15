@@ -34,44 +34,7 @@
 #include <private/android_filesystem_config.h>
 
 #include "log.h"
-#include "list.h"
 #include "util.h"
-
-static int log_fd = -1;
-/* Inital log level before init.rc is parsed and this this is reset. */
-static int log_level = LOG_DEFAULT_LEVEL;
-
-
-void log_set_level(int level) {
-    log_level = level;
-}
-
-void log_init(void)
-{
-    static const char *name = "/dev/__kmsg__";
-    if (mknod(name, S_IFCHR | 0600, (1 << 8) | 11) == 0) {
-        log_fd = open(name, O_WRONLY);
-        fcntl(log_fd, F_SETFD, FD_CLOEXEC);
-        unlink(name);
-    }
-}
-
-#define LOG_BUF_MAX 512
-
-void log_write(int level, const char *fmt, ...)
-{
-    char buf[LOG_BUF_MAX];
-    va_list ap;
-    
-    if (level > log_level) return;
-    if (log_fd < 0) return;
-    
-    va_start(ap, fmt);
-    vsnprintf(buf, LOG_BUF_MAX, fmt, ap);
-    buf[LOG_BUF_MAX - 1] = 0;
-    va_end(ap);
-    write(log_fd, buf, strlen(buf));
-}
 
 /*
  * android_name_to_id - returns the integer uid/gid associated with the given
@@ -190,26 +153,6 @@ oops:
     close(fd);
     if(data != 0) free(data);
     return 0;
-}
-
-void list_init(struct listnode *node)
-{
-    node->next = node;
-    node->prev = node;
-}
-
-void list_add_tail(struct listnode *head, struct listnode *item)
-{
-    item->next = head;
-    item->prev = head->prev;
-    head->prev->next = item;
-    head->prev = item;
-}
-
-void list_remove(struct listnode *item)
-{
-    item->next->prev = item->prev;
-    item->prev->next = item->next;
 }
 
 #define MAX_MTD_PARTITIONS 16
@@ -439,8 +382,9 @@ void get_hardware_name(char *hardware, unsigned int *revision)
         if (x) {
             x += 2;
             n = 0;
-            while (*x && !isspace(*x)) {
-                hardware[n++] = tolower(*x);
+            while (*x && *x != '\n') {
+                if (!isspace(*x))
+                    hardware[n++] = tolower(*x);
                 x++;
                 if (n == 31) break;
             }
@@ -453,5 +397,35 @@ void get_hardware_name(char *hardware, unsigned int *revision)
         if (x) {
             *revision = strtoul(x + 2, 0, 16);
         }
+    }
+}
+
+void import_kernel_cmdline(int in_qemu,
+                           void (*import_kernel_nv)(char *name, int in_qemu))
+{
+    char cmdline[1024];
+    char *ptr;
+    int fd;
+
+    fd = open("/proc/cmdline", O_RDONLY);
+    if (fd >= 0) {
+        int n = read(fd, cmdline, 1023);
+        if (n < 0) n = 0;
+
+        /* get rid of trailing newline, it happens */
+        if (n > 0 && cmdline[n-1] == '\n') n--;
+
+        cmdline[n] = 0;
+        close(fd);
+    } else {
+        cmdline[0] = 0;
+    }
+
+    ptr = cmdline;
+    while (ptr && *ptr) {
+        char *x = strchr(ptr, ' ');
+        if (x != 0) *x++ = 0;
+        import_kernel_nv(ptr, in_qemu);
+        ptr = x;
     }
 }

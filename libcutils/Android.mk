@@ -35,9 +35,11 @@ commonSources := \
 	socket_loopback_client.c \
 	socket_loopback_server.c \
 	socket_network_client.c \
+	sockets.c \
 	config_utils.c \
 	cpu_info.c \
 	load_file.c \
+	list.c \
 	open_memstream.c \
 	strdup16to8.c \
 	strdup8to16.c \
@@ -46,7 +48,8 @@ commonSources := \
 	properties.c \
 	threads.c \
 	sched_policy.c \
-	iosched_policy.c
+	iosched_policy.c \
+	str_parms.c
 
 commonHostSources := \
         ashmem-host.c
@@ -91,25 +94,11 @@ LOCAL_CFLAGS += $(hostSmpFlag)
 include $(BUILD_HOST_STATIC_LIBRARY)
 
 
-ifeq ($(TARGET_SIMULATOR),true)
-
-# Shared library for simulator
-# ========================================================
-include $(CLEAR_VARS)
-LOCAL_MODULE := libcutils
-LOCAL_SRC_FILES := $(commonSources) $(commonHostSources) memory.c dlmalloc_stubs.c
-LOCAL_LDLIBS := -lpthread
-LOCAL_SHARED_LIBRARIES := liblog
-LOCAL_CFLAGS += $(targetSmpFlag)
-include $(BUILD_SHARED_LIBRARY)
-
-else #!sim
-
 # Shared and static library for target
 # ========================================================
 include $(CLEAR_VARS)
 LOCAL_MODULE := libcutils
-LOCAL_SRC_FILES := $(commonSources) ashmem-dev.c mq.c
+LOCAL_SRC_FILES := $(commonSources) ashmem-dev.c mq.c android_reboot.c partition_utils.c uevent.c qtaguid.c klog.c
 
 ifeq ($(TARGET_ARCH),arm)
 LOCAL_SRC_FILES += arch-arm/memset32.S
@@ -138,4 +127,10 @@ LOCAL_SHARED_LIBRARIES := liblog
 LOCAL_CFLAGS += $(targetSmpFlag)
 include $(BUILD_SHARED_LIBRARY)
 
-endif #!sim
+include $(CLEAR_VARS)
+LOCAL_MODULE := tst_str_parms
+LOCAL_CFLAGS += -DTEST_STR_PARMS
+LOCAL_SRC_FILES := str_parms.c hashmap.c memory.c
+LOCAL_SHARED_LIBRARIES := liblog
+LOCAL_MODULE_TAGS := optional
+include $(BUILD_EXECUTABLE)

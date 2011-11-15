@@ -174,6 +174,11 @@
 /* #define _LARGEFILE_SOURCE 1 */
 
 /*
+ * Define if platform has off64_t (and lseek64 and other xxx64 functions)
+ */
+#define HAVE_OFF64_T
+
+/*
  * Defined if we have the backtrace() call for retrieving a stack trace.
  * Needed for CallStack to operate; if not defined, CallStack is
  * non-functional.
@@ -185,7 +190,7 @@
  * with a memory address.  If not defined, stack crawls will not have symbolic
  * information.
  */
-#define HAVE_DLADDR 0
+#define HAVE_DLADDR 1
 
 /*
  * Defined if we have the cxxabi.h header for demangling C++ symbols.  If
@@ -206,7 +211,9 @@
 /*
  * Add any extra platform-specific defines here.
  */
+#ifndef __linux__
 #define __linux__
+#endif
 
 /*
  * Define if we have <malloc.h> header

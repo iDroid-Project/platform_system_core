@@ -69,6 +69,7 @@ struct Action
     Action *next;
 
     char cmd[64];    
+    const char *prod;
     void *data;
     unsigned size;
 
@@ -97,13 +98,19 @@ static Action *queue_action(unsigned op, const char *fmt, ...)
 {
     Action *a;
     va_list ap;
+    size_t cmdsize;
 
     a = calloc(1, sizeof(Action));
     if (a == 0) die("out of memory");
 
     va_start(ap, fmt);
-    vsprintf(a->cmd, fmt, ap);
+    cmdsize = vsnprintf(a->cmd, sizeof(a->cmd), fmt, ap);
     va_end(ap);
+
+    if (cmdsize >= sizeof(a->cmd)) {
+        free(a);
+        die("Command length (%d) exceeds maximum size (%d)", cmdsize, sizeof(a->cmd));
+    }
 
     if (action_last) {
         action_last->next = a;
@@ -177,6 +184,16 @@ static int cb_check(Action *a, int status, char *resp, int invert)
         return status;
     }
 
+    if (a->prod) {
+        if (strcmp(a->prod, cur_product) != 0) {
+            double split = now();
+            fprintf(stderr,"IGNORE, product is %s required only for %s [%7.3fs]\n",
+                    cur_product, a->prod, (split - a->start));
+            a->start = split;
+            return 0;
+        }
+    }
+
     yes = match(resp, value, count);
     if (invert) yes = !yes;
 
@@ -208,10 +225,12 @@ static int cb_reject(Action *a, int status, char *resp)
     return cb_check(a, status, resp, 1);
 }
 
-void fb_queue_require(const char *var, int invert, unsigned nvalues, const char **value)
+void fb_queue_require(const char *prod, const char *var,
+		int invert, unsigned nvalues, const char **value)
 {
     Action *a;
     a = queue_action(OP_QUERY, "getvar:%s", var);
+    a->prod = prod;
     a->data = value;
     a->size = nvalues;
     a->msg = mkmsg("checking %s", var);
@@ -236,6 +255,25 @@ void fb_queue_display(const char *var, const char *prettyname)
     a->data = strdup(prettyname);
     if (a->data == 0) die("out of memory");
     a->func = cb_display;
+}
+
+static int cb_save(Action *a, int status, char *resp)
+{
+    if (status) {
+        fprintf(stderr, "%s FAILED (%s)\n", a->cmd, resp);
+        return status;
+    }
+    strncpy(a->data, resp, a->size);
+    return 0;
+}
+
+void fb_queue_query_save(const char *var, char *dest, unsigned dest_size)
+{
+    Action *a;
+    a = queue_action(OP_QUERY, "getvar:%s", var);
+    a->data = (void *)dest;
+    a->size = dest_size;
+    a->func = cb_save;
 }
 
 static int cb_do_nothing(Action *a, int status, char *resp)
@@ -271,11 +309,11 @@ void fb_queue_notice(const char *notice)
     a->data = (void*) notice;
 }
 
-void fb_execute_queue(usb_handle *usb)
+int fb_execute_queue(usb_handle *usb)
 {
     Action *a;
     char resp[FB_RESPONSE_SZ+1];
-    int status;
+    int status = 0;
 
     a = action_list;
     resp[FB_RESPONSE_SZ] = 0;
@@ -308,5 +346,5 @@ void fb_execute_queue(usb_handle *usb)
     }
 
     fprintf(stderr,"finished. total time: %.3fs\n", (now() - start));
+    return status;
 }
-

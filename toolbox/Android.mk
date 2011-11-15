@@ -54,13 +54,19 @@ TOOLS := \
 	vmstat \
 	nandread \
 	ionice \
+	touch \
 	lsof
 
+ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
+TOOLS += r
+endif
+
 LOCAL_SRC_FILES:= \
+	dynarray.c \
 	toolbox.c \
 	$(patsubst %,%.c,$(TOOLS))
 
-LOCAL_SHARED_LIBRARIES := libcutils libc
+LOCAL_SHARED_LIBRARIES := libcutils libc libusbhost
 
 LOCAL_MODULE:= toolbox
 

@@ -13,6 +13,9 @@
 #include <grp.h>
 
 #include <linux/kdev_t.h>
+#include <limits.h>
+
+#include "dynarray.h"
 
 // bits for flags argument
 #define LIST_LONG           (1 << 0)
@@ -20,6 +23,8 @@
 #define LIST_RECURSIVE      (1 << 2)
 #define LIST_DIRECTORIES    (1 << 3)
 #define LIST_SIZE           (1 << 4)
+#define LIST_LONG_NUMERIC   (1 << 5)
+#define LIST_CLASSIFY       (1 << 6)
 
 // fwd
 static int listpath(const char *name, int flags);
@@ -41,7 +46,7 @@ static char mode2kind(unsigned mode)
 static void mode2str(unsigned mode, char *out)
 {
     *out++ = mode2kind(mode);
-    
+
     *out++ = (mode & 0400) ? 'r' : '-';
     *out++ = (mode & 0200) ? 'w' : '-';
     if(mode & 04000) {
@@ -129,7 +134,27 @@ static int listfile_size(const char *path, const char *filename, int flags)
     }
 
     /* blocks are 512 bytes, we want output to be KB */
-    printf("%lld %s\n", s.st_blocks / 2, filename);
+    if ((flags & LIST_SIZE) != 0) {
+        printf("%lld ", s.st_blocks / 2);
+    }
+
+    if ((flags & LIST_CLASSIFY) != 0) {
+        char filetype = mode2kind(s.st_mode);
+        if (filetype != 'l') {
+            printf("%c ", filetype);
+        } else {
+            struct stat link_dest;
+            if (!stat(path, &link_dest)) {
+                printf("l%c ", mode2kind(link_dest.st_mode));
+            } else {
+                fprintf(stderr, "stat '%s' failed: %s\n", path, strerror(errno));
+                printf("l? ");
+            }
+        }
+    }
+
+    printf("%s\n", filename);
+
     return 0;
 }
 
@@ -155,12 +180,17 @@ static int listfile_long(const char *path, int flags)
     }
 
     mode2str(s.st_mode, mode);
-    user2str(s.st_uid, user);
-    group2str(s.st_gid, group);
+    if (flags & LIST_LONG_NUMERIC) {
+        sprintf(user, "%ld", s.st_uid);
+        sprintf(group, "%ld", s.st_gid);
+    } else {
+        user2str(s.st_uid, user);
+        group2str(s.st_gid, group);
+    }
 
     strftime(date, 32, "%Y-%m-%d %H:%M", localtime((const time_t*)&s.st_mtime));
     date[31] = 0;
-    
+
 // 12345678901234567890123456789012345678901234567890123456789012345678901234567890
 // MMMMMMMM UUUUUUUU GGGGGGGGG XXXXXXXX YYYY-MM-DD HH:MM NAME (->LINK)
 
@@ -168,7 +198,7 @@ static int listfile_long(const char *path, int flags)
     case S_IFBLK:
     case S_IFCHR:
         printf("%s %-8s %-8s %3d, %3d %s %s\n",
-               mode, user, group, 
+               mode, user, group,
                (int) MAJOR(s.st_rdev), (int) MINOR(s.st_rdev),
                date, name);
         break;
@@ -182,7 +212,7 @@ static int listfile_long(const char *path, int flags)
 
         len = readlink(path, linkto, 256);
         if(len < 0) return -1;
-        
+
         if(len > 255) {
             linkto[252] = '.';
             linkto[253] = '.';
@@ -191,7 +221,7 @@ static int listfile_long(const char *path, int flags)
         } else {
             linkto[len] = 0;
         }
-        
+
         printf("%s %-8s %-8s          %s %s -> %s\n",
                mode, user, group, date, name, linkto);
         break;
@@ -206,7 +236,7 @@ static int listfile_long(const char *path, int flags)
 
 static int listfile(const char *dirname, const char *filename, int flags)
 {
-    if ((flags & (LIST_LONG | LIST_SIZE)) == 0) {
+    if ((flags & (LIST_LONG | LIST_SIZE | LIST_CLASSIFY)) == 0) {
         printf("%s\n", filename);
         return 0;
     }
@@ -233,6 +263,7 @@ static int listdir(const char *name, int flags)
     char tmp[4096];
     DIR *d;
     struct dirent *de;
+    strlist_t  files = STRLIST_INITIALIZER;
 
     d = opendir(name);
     if(d == 0) {
@@ -248,10 +279,16 @@ static int listdir(const char *name, int flags)
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         if(de->d_name[0] == '.' && (flags & LIST_ALL) == 0) continue;
 
-        listfile(name, de->d_name, flags);
+        strlist_append_dup(&files, de->d_name);
     }
 
+    strlist_sort(&files);
+    STRLIST_FOREACH(&files, filename, listfile(name, filename, flags));
+    strlist_done(&files);
+
     if (flags & LIST_RECURSIVE) {
+        strlist_t subdirs = STRLIST_INITIALIZER;
+
         rewinddir(d);
 
         while ((de = readdir(d)) != 0) {
@@ -284,10 +321,15 @@ static int listdir(const char *name, int flags)
             }
 
             if (S_ISDIR(s.st_mode)) {
-                printf("\n%s:\n", tmp);
-                listdir(tmp, flags);
+                strlist_append_dup(&subdirs, tmp);
             }
         }
+        strlist_sort(&subdirs);
+        STRLIST_FOREACH(&subdirs, path, {
+            printf("\n%s:\n", path);
+            listdir(path, flags);
+        });
+        strlist_done(&subdirs);
     }
 
     closedir(d);
@@ -327,33 +369,48 @@ int ls_main(int argc, char **argv)
 {
     int flags = 0;
     int listed = 0;
-    
+
     if(argc > 1) {
         int i;
         int err = 0;
+        strlist_t  files = STRLIST_INITIALIZER;
 
         for (i = 1; i < argc; i++) {
-            if (!strcmp(argv[i], "-l")) {
-                flags |= LIST_LONG;
-            } else if (!strcmp(argv[i], "-s")) {
-                flags |= LIST_SIZE;
-            } else if (!strcmp(argv[i], "-a")) {
-                flags |= LIST_ALL;
-            } else if (!strcmp(argv[i], "-R")) {
-                flags |= LIST_RECURSIVE;
-            } else if (!strcmp(argv[i], "-d")) {
-                flags |= LIST_DIRECTORIES;
-            } else {
-                listed++;
-                if(listpath(argv[i], flags) != 0) {
-                    err = EXIT_FAILURE;
+            if (argv[i][0] == '-') {
+                /* an option ? */
+                const char *arg = argv[i]+1;
+                while (arg[0]) {
+                    switch (arg[0]) {
+                    case 'l': flags |= LIST_LONG; break;
+                    case 'n': flags |= LIST_LONG | LIST_LONG_NUMERIC; break;
+                    case 's': flags |= LIST_SIZE; break;
+                    case 'R': flags |= LIST_RECURSIVE; break;
+                    case 'd': flags |= LIST_DIRECTORIES; break;
+                    case 'a': flags |= LIST_ALL; break;
+                    case 'F': flags |= LIST_CLASSIFY; break;
+                    default:
+                        fprintf(stderr, "%s: Unknown option '-%c'. Aborting.\n", "ls", arg[0]);
+                        exit(1);
+                    }
+                    arg++;
                 }
+            } else {
+                /* not an option ? */
+                strlist_append_dup(&files, argv[i]);
             }
         }
 
-        if (listed  > 0) return err;
+        if (files.count > 0) {
+            STRLIST_FOREACH(&files, path, {
+                if (listpath(path, flags) != 0) {
+                    err = EXIT_FAILURE;
+                }
+            });
+            strlist_done(&files);
+            return err;
+        }
     }
-    
-    // list working directory if no files or directories were specified    
+
+    // list working directory if no files or directories were specified
     return listpath(".", flags);
 }
